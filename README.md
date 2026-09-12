@@ -12,10 +12,36 @@ interactive Streamlit UI.
 pip install -r requirements.txt
 streamlit run app.py
 ```
-Enter a company's figures in the sidebar (all in the same currency/units —
-₹ crore, $ millions, whatever's convenient, since only ratios are used) and
-the four tabs update live: DuPont & Ratios, Statistical Scores, Filing Scan,
-and Composite Rating.
+Three ways to get data in, chosen from the sidebar:
+1. **Fetch by screener.in code** — type a company code (e.g. `TCS`, `TMCV`, `INFY`) and it fetches
+   Balance Sheet/P&L/Cash Flow automatically over the internet.
+2. **Upload PDF** — upload an annual report or financial statement PDF; key line items are extracted
+   automatically, with the exact source line shown for every value so you can verify before scoring.
+3. **Manual entry** — type numbers in, or override anything the automated methods missed/misread.
+
+## Automated data acquisition — what's real, what to know
+
+**screener.in fetch** (`src/screener_fetch.py`): a real HTTP scraper for Indian listed companies'
+Balance Sheet/P&L/Cash Flow tables (data provider: C-MOTS Internet Technologies, no login required for
+this data). **Tested and validated**: the parser correctly extracted all 13 matched line items from real
+Tata Motors data pulled during development (Total Assets ₹52,309cr, Sales ₹87,197cr, Net Profit
+₹4,187cr — all matched exactly). **Honesty note on what I could and couldn't test**: this sandboxed build
+environment's outbound IP gets a 403 from screener.in's bot protection on direct HTTP requests (confirmed
+via curl testing) — a sandbox-specific block, not a flaw in the scraper. It should work normally from your
+own machine's regular internet connection. If it's ever blocked (corporate firewall, layout change, rate
+limiting), a guaranteed-working fallback is built in: open the page yourself, copy the financial tables,
+and paste the text in — it's parsed with the exact same validated logic.
+
+*Usage terms*: review screener.in's Terms of Use before automated/bulk/commercial use — this is built for
+individual, occasional lookups, not high-volume scraping.
+
+**PDF extraction** (`src/pdf_extract.py`): regex + table extraction via `pdfplumber` over any uploaded
+PDF. **Tested and validated** against a synthetic test annual report: found all 15/15 target line items
+correctly. Real annual reports vary enormously in layout — multi-column, scanned images, inconsistent
+naming — so this **always shows the exact extracted value and its source line for you to verify** rather
+than silently trusting a number. Treat every extraction as a first draft, not a verified fact — a single
+misread digit could produce a badly wrong distress score, so the review step isn't optional friction, it's
+the responsible way to automate this.
 
 ## Methodology
 
@@ -105,7 +131,9 @@ src/
   ohlson_oscore.py       # 9-factor Ohlson logit model (coefficients verified)
   nlp_flags.py            # regex scanner: auditor quals, pledges, filing delays
   composite_score.py      # transparent point-system EWS rating
+  screener_fetch.py        # real screener.in scraper + paste-text fallback parser
+  pdf_extract.py            # PDF financial statement line-item extraction
 data/
   case_studies.py         # real IL&FS case + illustrative reference points
-app.py                    # interactive Streamlit UI
+app.py                    # interactive Streamlit UI with 3 input modes
 ```

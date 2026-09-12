@@ -19,6 +19,8 @@ from src.altman_zscore import ZScoreInputs, compute_all_variants
 from src.ohlson_oscore import OScoreInputs, ohlson_o_score
 from src.nlp_flags import scan_filing_text, summarize_flags
 from src.composite_score import compute_ews_score
+from src.pdf_extract import extract_from_pdf
+from src.screener_fetch import fetch_company_live, parse_pasted_screener_text
 
 st.set_page_config(page_title="Corporate Early Warning System", layout="wide")
 st.title("Corporate Early Warning System for Distressed Debt")
@@ -27,48 +29,112 @@ st.caption("Fundamental forensics + Altman Z-Score + Ohlson O-Score + NLP filing
 
 with st.expander("How to use this / what it is", expanded=False):
     st.markdown("""
-Enter a company's most recent annual (or TTM) financial-statement figures in the sidebar, then:
-- **DuPont & Ratios** tab shows ROE decomposition and cash flow/coverage/working-capital forensics.
-- **Statistical Scores** tab shows all four Altman Z-Score variants and the Ohlson O-Score.
-- **Filing Scan** tab lets you paste any announcement/filing text to check for auditor qualification,
-  promoter pledge, or delayed-filing red flags.
-- **Composite Rating** tab combines everything into one transparent, point-by-point EWS score.
+Three ways to get a company's numbers in -- pick whichever works for you:
 
-All figures should be in the same currency/units (e.g., all in ₹ crore, or all in $ millions) -- the
-model only uses ratios, so units cancel out as long as you're consistent.
+1. **Fetch by screener.in code** -- type a company's screener.in code (e.g. `TCS`, `TMCV`, `INFY`) and the
+   app tries to fetch its financials automatically over the internet. Works from a normal home/office
+   connection; if it's blocked (corporate firewall, anti-bot protection), a paste-text fallback is built in.
+2. **Upload a PDF** -- upload an annual report or financial statement PDF and key line items are extracted
+   automatically. **Always check the extracted numbers** -- PDF layouts vary a lot, and the exact source
+   line is shown for every value so you can verify nothing was misread before trusting the score.
+3. **Manual entry** -- type numbers in yourself, or override anything the automated methods got wrong.
+
+All figures should be in the same currency/units -- the model only uses ratios, so units cancel out as
+long as you're consistent.
 """)
 
+# ---------------------------------------------------------------------------
+# STEP 1: Automated data acquisition (screener.in fetch, PDF upload, or skip)
+# ---------------------------------------------------------------------------
+st.sidebar.header("1. Get Company Data (automated)")
+input_mode = st.sidebar.radio("Input method", ["Fetch by screener.in code", "Upload PDF", "Manual entry only"])
+
+fetched = {}
+
+if input_mode == "Fetch by screener.in code":
+    code = st.sidebar.text_input("screener.in company code (e.g. TCS, TMCV, INFY)", "")
+    consolidated = st.sidebar.checkbox("Consolidated figures", value=True)
+    if st.sidebar.button("Fetch") and code.strip():
+        with st.sidebar:
+            with st.spinner("Fetching..."):
+                result = fetch_company_live(code.strip(), consolidated=consolidated)
+        if result.get("success"):
+            fetched = result
+            n = len([k for k in result if not k.startswith("_") and k not in ("success", "source_url")])
+            st.sidebar.success(f"Fetched {n} fields from screener.in.")
+        else:
+            st.sidebar.error(f"Live fetch failed: {result.get('error')}")
+            st.sidebar.info(result.get("hint", ""))
+            if result.get("url_to_open_manually"):
+                st.sidebar.markdown(f"[Open the page manually]({result['url_to_open_manually']}) and "
+                                      f"paste the Balance Sheet/P&L/Cash Flow sections below:")
+    pasted = st.sidebar.text_area("...or paste screener.in page text here (guaranteed-working fallback)", height=120)
+    if pasted.strip():
+        fetched = parse_pasted_screener_text(pasted)
+        st.sidebar.success(f"Parsed {len([k for k in fetched if not k.startswith('_')])} fields from pasted text.")
+        if fetched.get("_extraction_note"):
+            st.sidebar.caption(fetched["_extraction_note"])
+
+elif input_mode == "Upload PDF":
+    uploaded = st.sidebar.file_uploader("Upload annual report / financial statement PDF", type=["pdf"])
+    if uploaded is not None:
+        with st.sidebar:
+            with st.spinner("Extracting financial line items from PDF..."):
+                pdf_result = extract_from_pdf(uploaded)
+        st.sidebar.success(f"Found {pdf_result['n_fields_found']}/{pdf_result['n_fields_total']} fields.")
+        if pdf_result["missing_fields"]:
+            st.sidebar.warning(f"Not found (enter manually below): {', '.join(pdf_result['missing_fields'])}")
+        with st.sidebar.expander("Review extracted values (please verify!)", expanded=True):
+            for field, ctx in pdf_result["context"].items():
+                st.write(f"**{field}** = {pdf_result['extracted'][field]:,.2f}")
+                st.caption(f"page {ctx['page']}: \"{ctx['line'][:90]}\"")
+        fetched = dict(pdf_result["extracted"])
+
+if fetched:
+    st.sidebar.warning("Fields below are pre-filled from automated extraction -- double-check anything "
+                        "that looks wrong before computing the score.")
+
+
+def pre(*keys, default=0.0):
+    """Returns the first matching pre-fetched/extracted value found under any of the given key aliases."""
+    for k in keys:
+        if k in fetched and fetched[k] is not None:
+            return float(fetched[k])
+    return default
+
+
+st.sidebar.header("2. Review / Complete Company Financials")
 with st.sidebar:
-    st.header("Company Financials")
     company_name = st.text_input("Company name (optional)", "")
     is_emerging_market = st.checkbox("Emerging market company (recommended for India)", value=True)
     is_public = st.checkbox("Publicly listed (has a market value of equity)", value=True)
 
     st.subheader("Balance Sheet")
-    total_assets = st.number_input("Total Assets", value=1000.0, min_value=0.01)
-    total_liabilities = st.number_input("Total Liabilities", value=600.0, min_value=0.0)
-    current_assets = st.number_input("Current Assets", value=400.0, min_value=0.0)
-    current_liabilities = st.number_input("Current Liabilities", value=250.0, min_value=0.0)
+    total_assets = st.number_input("Total Assets", value=pre("total_assets", default=1000.0), min_value=0.01)
+    total_liabilities = st.number_input("Total Liabilities", value=pre("total_liabilities", default=600.0), min_value=0.0)
+    current_assets = st.number_input("Current Assets", value=pre("current_assets", default=400.0), min_value=0.0)
+    current_liabilities = st.number_input("Current Liabilities", value=pre("current_liabilities", default=250.0), min_value=0.0)
     working_capital = current_assets - current_liabilities
-    retained_earnings = st.number_input("Retained Earnings", value=200.0)
-    book_value_equity = st.number_input("Book Value of Equity", value=total_assets - total_liabilities)
+    retained_earnings = st.number_input("Retained Earnings", value=pre("retained_earnings", "reserves", default=200.0))
+    default_book_equity = pre("total_equity", default=(total_assets - total_liabilities))
+    book_value_equity = st.number_input("Book Value of Equity", value=default_book_equity)
     market_value_equity = st.number_input("Market Value of Equity (if public)", value=800.0) if is_public else None
-    receivables = st.number_input("Trade Receivables", value=120.0, min_value=0.0)
-    payables = st.number_input("Trade Payables", value=100.0, min_value=0.0)
-    inventory = st.number_input("Inventory", value=80.0, min_value=0.0)
+    receivables = st.number_input("Trade Receivables", value=pre("receivables", default=120.0), min_value=0.0)
+    payables = st.number_input("Trade Payables", value=pre("payables", default=100.0), min_value=0.0)
+    inventory = st.number_input("Inventory", value=pre("inventory", default=80.0), min_value=0.0)
 
     st.subheader("Income Statement")
-    sales = st.number_input("Sales / Revenue", value=1200.0, min_value=0.01)
-    cogs = st.number_input("Cost of Goods Sold", value=800.0, min_value=0.0)
-    ebit = st.number_input("EBIT", value=150.0)
-    ebitda = st.number_input("EBITDA", value=200.0)
-    interest_expense = st.number_input("Interest Expense", value=40.0, min_value=0.01)
-    net_income = st.number_input("Net Income (current year)", value=80.0)
+    sales = st.number_input("Sales / Revenue", value=pre("sales", default=1200.0), min_value=0.01)
+    cogs = st.number_input("Cost of Goods Sold", value=pre("expenses", default=800.0), min_value=0.0)
+    ebit = st.number_input("EBIT", value=pre("ebit", "operating_profit", default=150.0))
+    ebitda = st.number_input("EBITDA", value=pre("ebitda", "operating_profit", default=200.0))
+    interest_expense = st.number_input("Interest Expense", value=pre("interest_expense", "interest", default=40.0), min_value=0.01)
+    net_income = st.number_input("Net Income (current year)", value=pre("net_income", "net_profit", default=80.0))
     net_income_prior = st.number_input("Net Income (prior year)", value=70.0)
     net_income_2yr_ago = st.number_input("Net Income (2 years ago, for CFO trend)", value=60.0)
 
     st.subheader("Cash Flow")
-    cfo = st.number_input("Cash Flow from Operations (CFO)", value=110.0)
+    cfo = st.number_input("Cash Flow from Operations (CFO)", value=pre("cfo", default=110.0))
     cfo_prior = st.number_input("CFO (prior year)", value=100.0)
 
     st.subheader("Filing / Announcement Text (optional)")
