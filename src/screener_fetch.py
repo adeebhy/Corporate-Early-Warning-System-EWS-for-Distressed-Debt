@@ -1,152 +1,222 @@
 """
-screener_fetch.py
--------------------
-Automated data ingestion for Indian listed companies from screener.in
-(data provider: C-MOTS Internet Technologies), which publishes clean
-Balance Sheet / P&L / Cash Flow / Ratios tables for every NSE/BSE-listed
-company with no login required for this level of data.
-
-TWO MODES, sharing the same table-parsing logic:
-
-1. LIVE FETCH (`fetch_company_live`): makes a real HTTP GET request to
-   screener.in's company page and parses the returned HTML tables directly.
-   HONESTY NOTE: this build/test environment's outbound IP gets a 403 from
-   screener.in's bot protection (confirmed via direct curl testing) even
-   though the page is reachable through other channels -- a sandboxed-
-   environment limitation, not a flaw in the scraping logic. It should
-   work normally from your own machine's normal internet connection
-   (screener.in has no login-wall for this data and is commonly scraped by
-   retail-investor tools). If it doesn't -- corporate firewall, a future
-   layout change, temporary rate-limiting -- mode 2 is a guaranteed-working
-   fallback.
-
-2. PASTE-TEXT FALLBACK (`parse_pasted_screener_text`): open the company's
-   screener.in page in your own browser, copy the Balance Sheet / P&L /
-   Cash Flow sections, and paste the text in. Uses the identical row-
-   parsing logic, validated against real Tata Motors data retrieved during
-   development.
-
-Usage terms: screener.in's data is provided by C-MOTS Internet Technologies;
-review screener.in's Terms of Use before any automated/bulk/commercial use --
-this is intended for individual, occasional lookups, not high-volume scraping.
+src/screener_fetch.py
+---------------------
+Scrapes financial tables from screener.in and extracts both standard
+EWS model inputs and comprehensive extended line items.
 """
-import re
+
 import requests
 from bs4 import BeautifulSoup
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-LINE_ITEM_KEYWORDS = {
-    "total_assets": ["total assets"],
-    "total_liabilities": ["total liabilities"],
-    "reserves": ["reserves"],
-    "borrowings": ["borrowings"],
-    "equity_capital": ["equity capital"],
-    "sales": ["sales"],
-    "expenses": ["expenses"],
-    "operating_profit": ["operating profit"],
-    "interest": ["interest"],
-    "net_profit": ["net profit"],
-    "cfo": ["cash from operating activity"],
-    "cfi": ["cash from investing activity"],
-    "cff": ["cash from financing activity"],
-}
+import re
 
 
-def _clean_number(s: str):
-    s = s.strip().replace(",", "").replace("\u20b9", "")
-    if s in ("", "-", "\u2014"):
+def clean_number(text: str):
+    if not text:
         return None
-    neg = s.startswith("(") and s.endswith(")")
-    s = s.strip("()")
+    # Remove commas, percentage signs, and whitespace
+    cleaned = re.sub(r"[^\d.-]", "", text.strip())
     try:
-        val = float(s)
-        return -val if neg else val
+        return float(cleaned)
     except ValueError:
         return None
 
 
-def _parse_markdown_style_tables(text: str) -> dict:
-    results = {}
-    lines = text.split("\n")
-    for line in lines:
-        if "|" not in line:
-            continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if not cells or not cells[0]:
-            continue
-        label_raw = cells[0].strip()
-        label = re.sub(r"\s*\+\s*$", "", label_raw).strip().lower()
-        if re.match(r"^[-\s]+$", label):
-            continue
-        values = [_clean_number(c) for c in cells[1:]]
-        values = [v for v in values if v is not None]
-        for canonical, keywords in LINE_ITEM_KEYWORDS.items():
-            if any(kw == label or (kw in label and len(label) < len(kw) + 15) for kw in keywords):
-                if values:
-                    results[canonical] = values
-    return results
+def fetch_company_live(code: str, consolidated: bool = True) -> dict:
+    code = code.strip().upper()
+    url = f"https://www.screener.in/company/{code}/consolidated/" if consolidated else f"https://www.screener.in/company/{code}/"
 
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
 
-def parse_pasted_screener_text(text: str) -> dict:
-    raw = _parse_markdown_style_tables(text)
-    return _to_latest_period_dict(raw)
-
-
-def _to_latest_period_dict(raw: dict) -> dict:
-    latest = {k: v[-1] for k, v in raw.items() if v}
-    latest["_extraction_note"] = (
-        "Values taken from the LAST (most recent) column found for each line item. "
-        "IMPORTANT: different tables (Balance Sheet vs. P&L vs. Cash Flow) can have "
-        "different last-column periods -- e.g. a P&L table's last column is often "
-        "'TTM' (trailing twelve months) while the Balance Sheet's last column is a "
-        "point-in-time snapshot (e.g. 'Mar 2026'). Mixing a TTM income statement with "
-        "the latest balance sheet is standard analyst practice, but please verify the "
-        "periods you're combining make sense together before trusting the score."
-    )
-    return latest
-
-
-def fetch_company_live(bse_or_nse_symbol: str, consolidated: bool = True) -> dict:
-    suffix = "consolidated/" if consolidated else ""
-    url = f"https://www.screener.in/company/{bse_or_nse_symbol}/{suffix}"
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        return dict(success=False, error=str(e),
-                    hint="Live fetch failed -- this can happen from restricted/corporate networks or if "
-                         "screener.in's bot protection blocks the request. Use the paste-text fallback: "
-                         "open the URL below in your browser, copy the Balance Sheet/P&L/Cash Flow sections, "
-                         "and paste them into the app.",
-                    url_to_open_manually=url)
+        resp = requests.get(url, headers=headers, timeout=12)
+        if resp.status_code == 404 and consolidated:
+            # Fallback to standalone if consolidated page doesn't exist
+            url = f"https://www.screener.in/company/{code}/"
+            resp = requests.get(url, headers=headers, timeout=12)
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    raw = {}
-    for table in soup.find_all("table"):
+        if resp.status_code != 200:
+            return {
+                "success": False,
+                "error": f"HTTP {resp.status_code} - Unable to reach screener.in",
+                "url_to_open_manually": url,
+                "hint": "Check if ticker symbol is correct or if IP is rate-limited."
+            }
+
+        return parse_screener_html(resp.text, source_url=url)
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "url_to_open_manually": url,
+            "hint": "Connection error or timeout."
+        }
+
+
+def parse_screener_html(html_text: str, source_url: str = "") -> dict:
+    soup = BeautifulSoup(html_text, "html.parser")
+    data = {"success": True, "source_url": source_url}
+
+    def extract_table(section_id):
+        table_dict = {}
+        section = soup.find("section", {"id": section_id})
+        if not section:
+            return table_dict
+
+        table = section.find("table")
+        if not table:
+            return table_dict
+
+        # Extract dates / headers
+        headers = [th.get_text(strip=True) for th in table.find_all("th")]
+        periods = headers[1:] if len(headers) > 1 else []
+
         for row in table.find_all("tr"):
-            cells = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
-            if len(cells) < 2:
-                continue
-            label = re.sub(r"\s*\+\s*$", "", cells[0]).strip().lower()
-            values = [_clean_number(c) for c in cells[1:]]
-            values = [v for v in values if v is not None]
-            for canonical, keywords in LINE_ITEM_KEYWORDS.items():
-                if any(kw == label or (kw in label and len(label) < len(kw) + 15) for kw in keywords):
-                    if values:
-                        raw[canonical] = values
+            cols = [td.get_text(strip=True) for td in row.find_all("td")]
+            if len(cols) >= 2:
+                row_label = cols[0].strip().lower()
+                row_label = re.sub(r"\s+", "_", row_label)
+                row_label = re.sub(r"[+%/()&.-]", "", row_label).strip("_")
 
-    if not raw:
-        return dict(success=False, error="No recognizable financial tables found in the response.",
-                    hint="The page structure may have changed, or the request was blocked/redirected. "
-                         "Use the paste-text fallback.",
-                    url_to_open_manually=url)
+                # Grab latest period (last column) and T-1 (second to last)
+                latest_val = clean_number(cols[-1])
+                prior_val = clean_number(cols[-2]) if len(cols) > 2 else None
 
-    result = _to_latest_period_dict(raw)
-    result["success"] = True
-    result["source_url"] = url
-    return result
+                table_dict[row_label] = latest_val
+                if prior_val is not None:
+                    table_dict[f"{row_label}_prior"] = prior_val
+
+        return table_dict
+
+    # 1. Parse all primary financial tables
+    pl_data = extract_table("profit-loss")
+    bs_data = extract_table("balance-sheet")
+    cf_data = extract_table("cash-flow")
+    ratio_data = extract_table("ratios")
+
+    # 2. Extract Top Overview / Market Cap Cards
+    overview = {}
+    for li in soup.select("ul#top-ratios li"):
+        name_elem = li.select_one(".name")
+        val_elem = li.select_one(".value")
+        if name_elem and val_elem:
+            key = re.sub(r"[^\w]+", "_", name_elem.get_text(strip=True).lower()).strip("_")
+            overview[key] = clean_number(val_elem.get_text(strip=True))
+
+    # Merge all extracted metrics
+    raw_all = {**overview, **pl_data, **bs_data, **cf_data, **ratio_data}
+
+    # 3. Standardize keys for app.py and pre() matching
+    mappings = {
+        "sales": raw_all.get("sales"),
+        "expenses": raw_all.get("expenses"),
+        "operating_profit": raw_all.get("operating_profit"),
+        "ebit": raw_all.get("operating_profit"),
+        "ebitda": raw_all.get("operating_profit"),
+        "interest_expense": raw_all.get("interest"),
+        "net_income": raw_all.get("net_profit"),
+        "net_income_prior": raw_all.get("net_profit_prior"),
+        "total_assets": raw_all.get("total_assets"),
+        "total_equity": (
+            (raw_all.get("equity_capital") or 0.0) + (raw_all.get("reserves") or 0.0)
+            if ("equity_capital" in raw_all or "reserves" in raw_all)
+            else None
+        ),
+        "retained_earnings": raw_all.get("reserves"),
+        "cfo": raw_all.get("cash_from_operating_activity"),
+        "cfo_prior": raw_all.get("cash_from_operating_activity_prior"),
+        "borrowings": raw_all.get("borrowings"),
+        "market_cap": raw_all.get("market_cap"),
+        "current_price": raw_all.get("current_price"),
+        "roce": raw_all.get("roce"),
+        "debtor_days": raw_all.get("debtor_days"),
+        "inventory_days": raw_all.get("inventory_days"),
+        "days_payable": raw_all.get("days_payable"),
+        "working_capital_days": raw_all.get("working_capital_days"),
+    }
+
+    # Include all mapped keys and all raw parsed metrics
+    for k, v in mappings.items():
+        if v is not None:
+            data[k] = v
+
+    for k, v in raw_all.items():
+        if k not in data and v is not None:
+            data[k] = v
+
+    return data
+
+def parse_pasted_screener_text(pasted_text: str) -> dict:
+    """
+    Parses unstructured or tab-separated text copied and pasted
+    directly from screener.in web pages.
+    """
+    if not pasted_text or not pasted_text.strip():
+        return {}
+
+    lines = pasted_text.strip().splitlines()
+    data = {"success": True, "_extraction_note": "Parsed from pasted text"}
+    raw_parsed = {}
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # Split by tabs or multiple spaces commonly produced when copying web tables
+        parts = re.split(r"\t+|\s{2,}", line)
+        if len(parts) >= 2:
+            key_raw = parts[0].strip().lower()
+            key = re.sub(r"\s+", "_", key_raw)
+            key = re.sub(r"[+%/()&.-]", "", key).strip("_")
+
+            # Extract the latest reported figure (last column) and prior figure if available
+            vals = [clean_number(p) for p in parts[1:] if clean_number(p) is not None]
+            if vals:
+                raw_parsed[key] = vals[-1]
+                if len(vals) > 1:
+                    raw_parsed[f"{key}_prior"] = vals[-2]
+
+    # Standardize extracted keys to match app.py expected keys
+    mappings = {
+        "sales": raw_parsed.get("sales"),
+        "expenses": raw_parsed.get("expenses"),
+        "operating_profit": raw_parsed.get("operating_profit"),
+        "ebit": raw_parsed.get("operating_profit"),
+        "ebitda": raw_parsed.get("operating_profit"),
+        "interest_expense": raw_parsed.get("interest"),
+        "net_income": raw_parsed.get("net_profit"),
+        "net_income_prior": raw_parsed.get("net_profit_prior"),
+        "total_assets": raw_parsed.get("total_assets"),
+        "total_equity": (
+            (raw_parsed.get("equity_capital") or 0.0) + (raw_parsed.get("reserves") or 0.0)
+            if ("equity_capital" in raw_parsed or "reserves" in raw_parsed)
+            else None
+        ),
+        "retained_earnings": raw_parsed.get("reserves"),
+        "cfo": raw_parsed.get("cash_from_operating_activity"),
+        "cfo_prior": raw_parsed.get("cash_from_operating_activity_prior"),
+        "borrowings": raw_parsed.get("borrowings"),
+        "market_cap": raw_parsed.get("market_cap"),
+        "current_price": raw_parsed.get("current_price"),
+        "roce": raw_parsed.get("roce"),
+        "debtor_days": raw_parsed.get("debtor_days"),
+        "inventory_days": raw_parsed.get("inventory_days"),
+        "days_payable": raw_parsed.get("days_payable"),
+        "working_capital_days": raw_parsed.get("working_capital_days"),
+    }
+
+    for k, v in mappings.items():
+        if v is not None:
+            data[k] = v
+
+    for k, v in raw_parsed.items():
+        if k not in data and v is not None:
+            data[k] = v
+
+    return data
