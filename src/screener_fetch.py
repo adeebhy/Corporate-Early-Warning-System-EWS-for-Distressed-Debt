@@ -130,7 +130,8 @@ def parse_screener_html(html_text: str, source_url: str = "") -> dict:
         "retained_earnings": raw_all.get("reserves"),
         "cfo": raw_all.get("cash_from_operating_activity"),
         "cfo_prior": raw_all.get("cash_from_operating_activity_prior"),
-        "borrowings": raw_all.get("borrowings"),
+        "borrowings": raw_all.get("borrowings") or raw_all.get("total_debt"),
+        "other_liabilities": raw_all.get("other_liabilities"),
         "market_cap": raw_all.get("market_cap"),
         "current_price": raw_all.get("current_price"),
         "roce": raw_all.get("roce"),
@@ -150,6 +151,7 @@ def parse_screener_html(html_text: str, source_url: str = "") -> dict:
             data[k] = v
 
     return data
+
 
 def parse_pasted_screener_text(pasted_text: str) -> dict:
     """
@@ -201,7 +203,8 @@ def parse_pasted_screener_text(pasted_text: str) -> dict:
         "retained_earnings": raw_parsed.get("reserves"),
         "cfo": raw_parsed.get("cash_from_operating_activity"),
         "cfo_prior": raw_parsed.get("cash_from_operating_activity_prior"),
-        "borrowings": raw_parsed.get("borrowings"),
+        "borrowings": raw_parsed.get("borrowings") or raw_parsed.get("total_debt"),
+        "other_liabilities": raw_parsed.get("other_liabilities"),
         "market_cap": raw_parsed.get("market_cap"),
         "current_price": raw_parsed.get("current_price"),
         "roce": raw_parsed.get("roce"),

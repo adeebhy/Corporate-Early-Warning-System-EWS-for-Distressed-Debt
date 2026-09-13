@@ -12,6 +12,7 @@ Run: streamlit run app.py
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
 
 from src.dupont import dupont_decomposition, dupont_trend_flag
 from src.ratios import cash_flow_conversion, interest_coverage_ratio, working_capital_stress, cash_flow_divergence_flag
@@ -25,6 +26,68 @@ from src.merton_dd import MertonInputs, compute_merton_dd
 from src.beneish_mscore import BeneishInputs, compute_beneish_mscore
 from src.india_signals import promoter_pledge_flag, rating_drift_flag, contingent_liabilities_flag
 from src.stress_test import StressTestBaseline, run_stress_test, find_breaking_point
+
+import numpy as np
+
+
+def compute_ticker_volatility(ticker: str, fallback: float = 0.35) -> float:
+    """Fetches 1 year of daily close data from Yahoo Finance and computes annualized volatility."""
+    if not ticker or not ticker.strip():
+        return fallback
+    try:
+        import yfinance as yf
+        for suffix in [".NS", ".BO"]:
+            df = yf.download(f"{ticker.strip().upper()}{suffix}", period="1y", interval="1d", progress=False)
+            if df is not None and len(df) > 40:
+                closes = df["Close"]
+                if hasattr(closes, "iloc") and closes.ndim > 1:
+                    closes = closes.iloc[:, 0]
+                rets = np.log(closes / closes.shift(1)).dropna()
+                vol = float(rets.std() * np.sqrt(252))
+                if 0.05 <= vol <= 2.5:
+                    return round(vol, 4)
+    except Exception:
+        pass
+    return fallback
+
+
+def generate_merton_explanation(company_name: str, merton_result: dict) -> str:
+    """Generates plain-language credit analyst commentary explaining DD and PD values."""
+    dd = merton_result.get("distance_to_default", 0.0)
+    pd_val = merton_result.get("probability_of_default", 0.0) * 100
+    leverage = merton_result.get("leverage_ratio", 0.0) * 100
+    va = merton_result.get("asset_value", 0.0)
+    dp = merton_result.get("default_point", 0.0)
+    vol = merton_result.get("asset_volatility", 0.0) * 100
+
+    name = company_name.strip() if (company_name and company_name.strip()) else "The company"
+
+    if dd >= 6.0:
+        return (
+            f"**Why is {name}'s Distance-to-Default so high ({dd:.2f}σ)?**\n\n"
+            f"- **Negligible Leverage Burden:** Market-implied assets (₹{va:,.0f} Cr) dwarf the default point (₹{dp:,.0f} Cr). "
+            f"Debt represents only **{leverage:.1f}%** of total firm value.\n"
+            f"- **Why Theoretical PD displays 0.00%:** In a Gaussian distribution $\\Phi(-DD)$, a Z-score beyond 5σ drops below $10^{{-7}}$. "
+            f"At {dd:.2f}σ, probability is $< 10^{{-30}}$, which numerical floats round to 0.00%. In practice, banks floor this at 0.03% (3 bps)."
+        )
+    elif dd >= 3.0:
+        return (
+            f"**What does {name}'s score of {dd:.2f}σ signify?**\n\n"
+            f"- **Healthy Solvency Coverage:** Implied assets of ₹{va:,.0f} Cr provide adequate buffer over debt commitments of ₹{dp:,.0f} Cr (leverage is **{leverage:.1f}%**).\n"
+            f"- **Asset Volatility:** Solved asset volatility stands at **{vol:.1f}%**."
+        )
+    elif dd >= 1.5:
+        return (
+            f"**⚠️ Watchlist Alert for {name} ({dd:.2f}σ):**\n\n"
+            f"- **Elevated Leverage:** Debt obligations account for **{leverage:.1f}%** of implied assets.\n"
+            f"- **Default Cushion:** Asset volatility is **{vol:.1f}%**. An equity drawdown would quickly push the company into default territory."
+        )
+    else:
+        return (
+            f"**🚨 High Distress Signal for {name} ({dd:.2f}σ):**\n\n"
+            f"- **Severe Debt Overhang:** Debt obligations represent **{leverage:.1f}%** of total enterprise value (Default Point: ₹{dp:,.0f} Cr vs Assets: ₹{va:,.0f} Cr).\n"
+            f"- **Elevated Default Probability:** Market pricing reflects a 1-year default probability of **{pd_val:.2f}%**."
+        )
 
 st.set_page_config(page_title="Corporate Early Warning System", layout="wide")
 st.title("Corporate Early Warning System for Distressed Debt")
@@ -53,31 +116,46 @@ long as you're consistent.
 st.sidebar.header("1. Get Company Data (automated)")
 input_mode = st.sidebar.radio("Input method", ["Fetch by screener.in code", "Upload PDF", "Manual entry only"])
 
-fetched = {}
+if "fetched_data" not in st.session_state:
+    st.session_state.fetched_data = {}
+
+fetched = st.session_state.fetched_data
 
 if input_mode == "Fetch by screener.in code":
     code = st.sidebar.text_input("screener.in company code (e.g. TCS, TMCV, INFY)", "")
     consolidated = st.sidebar.checkbox("Consolidated figures", value=True)
+
     if st.sidebar.button("Fetch") and code.strip():
         with st.sidebar:
             with st.spinner("Fetching..."):
                 result = fetch_company_live(code.strip(), consolidated=consolidated)
         if result.get("success"):
-            fetched = result
+            st.session_state.fetched_data = result
+            fetched = st.session_state.fetched_data
+
+            # --- THE FORCE-FEED FIX: Inject the massive debt directly into widget state ---
+            st.session_state["merton_mcap"] = float(result.get("market_cap") or 800.0)
+            st.session_state["merton_std"] = float(result.get("other_liabilities") or result.get("current_liabilities") or 150.0)
+            st.session_state["merton_ltd"] = float(result.get("borrowings") or result.get("total_debt") or 350.0)
+            # ------------------------------------------------------------------------------
+
             n = len([k for k in result if not k.startswith("_") and k not in ("success", "source_url")])
             st.sidebar.success(f"Fetched {n} fields from screener.in.")
         else:
             st.sidebar.error(f"Live fetch failed: {result.get('error')}")
             st.sidebar.info(result.get("hint", ""))
-            if result.get("url_to_open_manually"):
-                st.sidebar.markdown(f"[Open the page manually]({result['url_to_open_manually']}) and "
-                                      f"paste the Balance Sheet/P&L/Cash Flow sections below:")
+
     pasted = st.sidebar.text_area("...or paste screener.in page text here (guaranteed-working fallback)", height=120)
     if pasted.strip():
-        fetched = parse_pasted_screener_text(pasted)
+        result = parse_pasted_screener_text(pasted)
+        st.session_state.fetched_data = result
+        fetched = st.session_state.fetched_data
+
+        st.session_state["merton_mcap"] = float(result.get("market_cap") or 800.0)
+        st.session_state["merton_std"] = float(result.get("other_liabilities") or result.get("current_liabilities") or 150.0)
+        st.session_state["merton_ltd"] = float(result.get("borrowings") or result.get("total_debt") or 350.0)
+
         st.sidebar.success(f"Parsed {len([k for k in fetched if not k.startswith('_')])} fields from pasted text.")
-        if fetched.get("_extraction_note"):
-            st.sidebar.caption(fetched["_extraction_note"])
 
 elif input_mode == "Upload PDF":
     uploaded = st.sidebar.file_uploader("Upload annual report / financial statement PDF", type=["pdf"])
@@ -86,17 +164,17 @@ elif input_mode == "Upload PDF":
             with st.spinner("Extracting financial line items from PDF..."):
                 pdf_result = extract_from_pdf(uploaded)
         st.sidebar.success(f"Found {pdf_result['n_fields_found']}/{pdf_result['n_fields_total']} fields.")
-        if pdf_result["missing_fields"]:
-            st.sidebar.warning(f"Not found (enter manually below): {', '.join(pdf_result['missing_fields'])}")
-        with st.sidebar.expander("Review extracted values (please verify!)", expanded=True):
-            for field, ctx in pdf_result["context"].items():
-                st.write(f"**{field}** = {pdf_result['extracted'][field]:,.2f}")
-                st.caption(f"page {ctx['page']}: \"{ctx['line'][:90]}\"")
-        fetched = dict(pdf_result["extracted"])
+
+        st.session_state.fetched_data = dict(pdf_result["extracted"])
+        fetched = st.session_state.fetched_data
+
+        st.session_state["merton_mcap"] = float(fetched.get("market_cap") or 800.0)
+        st.session_state["merton_std"] = float(fetched.get("other_liabilities") or fetched.get("current_liabilities") or 150.0)
+        st.session_state["merton_ltd"] = float(fetched.get("borrowings") or fetched.get("total_debt") or 350.0)
 
 if fetched:
     st.sidebar.warning("Fields below are pre-filled from automated extraction -- double-check anything "
-                        "that looks wrong before computing the score.")
+                       "that looks wrong before computing the score.")
 
 
 def pre(*keys, default=0.0):
@@ -147,13 +225,47 @@ with st.sidebar:
 
 st.sidebar.header("3. Market Data (for Merton Distance-to-Default)")
 with st.sidebar:
-    market_cap = st.number_input("Market Capitalization", value=800.0, min_value=0.01)
-    equity_volatility = st.slider("Annualized Equity Volatility", 0.05, 1.50, 0.35, 0.01,
-                                    help="From daily stock returns: std(daily log returns) * sqrt(252). "
-                                         "yfinance/screener.in price history can compute this; enter manually here.")
-    short_term_debt = st.number_input("Short-Term Debt (due within 1 year)", value=150.0, min_value=0.0)
-    long_term_debt = st.number_input("Long-Term Debt", value=350.0, min_value=0.0)
-    risk_free_rate = st.number_input("Risk-Free Rate (e.g. 10Y G-Sec)", value=0.07, min_value=0.0, max_value=0.30, step=0.005, format="%.3f")
+    active_ticker = locals().get("code", "").strip().upper() if input_mode == "Fetch by screener.in code" else "MANUAL"
+    derived_vol = compute_ticker_volatility(active_ticker, fallback=0.35) if "compute_ticker_volatility" in globals() else 0.35
+
+    market_cap = st.number_input(
+        "Market Capitalization",
+        value=float(max(pre("market_cap", "market_value_equity", default=800.0), 0.01)),
+        min_value=0.01,
+        key="merton_mcap"
+    )
+
+    equity_volatility = st.slider(
+        "Annualized Equity Volatility",
+        min_value=0.05,
+        max_value=1.50,
+        value=float(min(max(derived_vol, 0.05), 1.50)),
+        step=0.01,
+        key="merton_vol",
+        help="Derived from 1-year daily return volatility via Yahoo Finance."
+    )
+
+    short_term_debt = st.number_input(
+        "Short-Term Debt (due within 1 year)",
+        value=float(pre("other_liabilities", "current_liabilities", default=150.0)),
+        min_value=0.0,
+        key="merton_std"
+    )
+    long_term_debt = st.number_input(
+        "Long-Term Debt",
+        value=float(pre("borrowings", "total_debt", default=350.0)),
+        min_value=0.0,
+        key="merton_ltd"
+    )
+    risk_free_rate = st.number_input(
+        "Risk-Free Rate (e.g. 10Y G-Sec)",
+        value=0.07,
+        min_value=0.0,
+        max_value=0.30,
+        step=0.005,
+        format="%.3f",
+        key="merton_rfr"
+    )
 
 st.sidebar.header("4. Prior-Year Data (for Beneish M-Score)")
 with st.sidebar:
@@ -164,13 +276,23 @@ with st.sidebar:
     current_assets_t1 = st.number_input("Current Assets (prior year)", value=current_assets * 0.9, min_value=0.0)
     ppe_t = st.number_input("Net PP&E (current year)", value=total_assets * 0.4, min_value=0.0)
     ppe_t1 = st.number_input("Net PP&E (prior year)", value=total_assets * 0.9 * 0.4, min_value=0.0)
-    total_assets_t1 = st.number_input("Total Assets (prior year)", value=total_assets * 0.9, min_value=0.01)
+    total_assets_t1 = st.number_input(
+        "Total Assets (prior year)",
+        value=max(float(pre("total_assets_prior", default=total_assets * 0.9)), 0.01),
+        min_value=0.01,
+        key="total_assets_t1_input",
+    )
     depreciation_t = st.number_input("Depreciation (current year)", value=ebitda - ebit if ebitda > ebit else 30.0, min_value=0.0)
     depreciation_t1 = st.number_input("Depreciation (prior year)", value=(ebitda - ebit) * 0.9 if ebitda > ebit else 27.0, min_value=0.0)
     sga_t = st.number_input("SG&A (current year)", value=sales * 0.1, min_value=0.0)
     sga_t1 = st.number_input("SG&A (prior year)", value=sales_t1 * 0.1, min_value=0.0)
     current_liabilities_t1 = st.number_input("Current Liabilities (prior year)", value=current_liabilities * 0.9, min_value=0.0)
-    long_term_debt_t1 = st.number_input("Long-Term Debt (prior year)", value=long_term_debt * 0.95, min_value=0.0)
+    long_term_debt_t1 = st.number_input(
+        "Long-Term Debt (prior year)",
+        value=long_term_debt * 0.95,
+        min_value=0.0,
+        key="long_term_debt_t1_input",
+    )
 
 st.sidebar.header("5. India-Specific Signals")
 with st.sidebar:
@@ -253,20 +375,30 @@ stress_baseline = StressTestBaseline(revenue=sales, gross_margin_pct=(sales - co
                                        current_interest_rate_pct=current_debt_rate,
                                        scheduled_principal_repayment=scheduled_principal)
 
-# --- Headline ---
+# --- Headline / Tabs Reorganization ---
 st.divider()
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Composite EWS Score", f"{ews['total_score']}/100")
-c2.metric("Rating", ews["rating"].split(" -- ")[0])
-z_em = z_variants["z_double_prime_em"]
-c3.metric("Altman Z''-EM Zone", z_em["zone"] if z_em else "N/A")
-if "error" not in merton_result:
-    c4.metric("Merton Distance-to-Default", f"{merton_result['distance_to_default']}σ")
-st.markdown(f"**{ews['rating']}**" + (f" — {company_name}" if company_name else ""))
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "DuPont & Ratios", "Statistical Scores", "Merton DD", "Beneish M-Score",
-    "India Signals", "Stress Test", "Composite Rating"])
+# 1. Add "Overview" as the very first tab in the list
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "Overview", "DuPont & Ratios", "Statistical Scores", "Merton DD",
+    "Beneish M-Score", "India Signals", "Stress Test", "Composite Rating"
+])
+
+# 2. Move the global metric columns entirely inside tab0
+with tab0:
+    st.subheader("Corporate Early Warning Summary")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Composite EWS Score", f"{ews['total_score']}/100")
+    c2.metric("Rating", ews["rating"].split(" -- ")[0])
+
+    z_em = z_variants.get("z_double_prime_em")
+    c3.metric("Altman Z''-EM Zone", z_em["zone"] if z_em else "N/A")
+
+    if "error" not in merton_result:
+        c4.metric("Merton Distance-to-Default", f"{merton_result['distance_to_default']}σ")
+
+    st.markdown(f"**{ews['rating']}**" + (f" — {company_name}" if company_name else ""))
+    st.info("Navigate through the tabs above to view specific model breakdowns.")
 
 with tab1:
     col1, col2 = st.columns(2)
@@ -324,18 +456,30 @@ with tab3:
     else:
         mc1, mc2, mc3 = st.columns(3)
         mc1.metric("Distance to Default", f"{merton_result['distance_to_default']}σ")
-        mc2.metric("Theoretical PD (1yr)", f"{merton_result['probability_of_default']*100:.3f}%")
+
+        pd_pct = merton_result["probability_of_default"] * 100
+        pd_str = "0.000%" if pd_pct == 0.0 else (f"{pd_pct:.2e}%" if pd_pct < 0.001 else f"{pd_pct:.3f}%")
+        mc2.metric("Theoretical PD (1yr)", pd_str)
+
         mc3.metric("Implied Asset Value", f"{merton_result['asset_value']:,.0f}")
-        st.write(f"**Default point (STD + 0.5×LTD):** {merton_result['default_point']:,.0f}  |  "
-                 f"**Asset volatility (solved):** {merton_result['asset_volatility']*100:.2f}%  |  "
-                 f"**Leverage (D/V_A):** {merton_result['leverage_ratio']*100:.1f}%")
+
+        st.write(
+            f"**Default point (STD + 0.5×LTD):** {merton_result['default_point']:,.0f}  |  "
+            f"**Asset volatility (solved):** {merton_result['asset_volatility']*100:.2f}%  |  "
+            f"**Leverage (D/V_A):** {merton_result['leverage_ratio']*100:.1f}%"
+        )
+
         if merton_result["distance_to_default"] < 1.5:
-            st.error(f"DD of {merton_result['distance_to_default']}σ is dangerously low -- market prices are "
-                     f"implying material default risk within the {merton_inputs.time_horizon:.0f}-year horizon.")
+            st.error(f"DD of {merton_result['distance_to_default']}σ is dangerously low -- market prices imply material default risk.")
         elif merton_result["distance_to_default"] < 3.0:
             st.warning(f"DD of {merton_result['distance_to_default']}σ is in a watch-zone range.")
         else:
             st.success(f"DD of {merton_result['distance_to_default']}σ indicates low market-implied default risk.")
+
+        display_name = company_name or locals().get("code", "") or "The company"
+        with st.expander("💡 What do these numbers signify? (Automated Credit Commentary)", expanded=True):
+            st.markdown(generate_merton_explanation(display_name, merton_result))
+
         st.caption(merton_result["note"])
         st.caption(f"Solver converged: {merton_result['solver_converged']} in {merton_result['solver_iterations']} iterations.")
 

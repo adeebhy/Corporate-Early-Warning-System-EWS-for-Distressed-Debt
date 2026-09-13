@@ -43,6 +43,7 @@ import numpy as np
 from scipy.stats import norm
 from scipy.optimize import brentq
 from dataclasses import dataclass
+import yfinance as yf
 
 
 @dataclass
@@ -128,3 +129,89 @@ def compute_merton_dd(i: MertonInputs) -> dict:
               "directionally useful but will generally understate true default risk at low DD "
               "compared to the empirical EDF."),
     )
+
+def generate_merton_explanation(company_name: str, merton_result: dict) -> str:
+    """
+    Generates plain-language credit analyst commentary explaining
+    why Distance-to-Default (DD) and PD reached their specific values.
+    """
+    dd = merton_result.get("distance_to_default", 0.0)
+    pd_val = merton_result.get("probability_of_default", 0.0) * 100
+    leverage = merton_result.get("leverage_ratio", 0.0) * 100
+    va = merton_result.get("asset_value", 0.0)
+    dp = merton_result.get("default_point", 0.0)
+    vol = merton_result.get("asset_volatility", 0.0) * 100
+
+    name = company_name.strip() if company_name.strip() else "The company"
+
+    # Case 1: Ultra-safe / Deleveraged / Asset-heavy
+    if dd >= 6.0:
+        commentary = (
+            f"**Why is {name}'s Distance-to-Default so high ({dd:.2f}σ)?**\n\n"
+            f"- **Negligible Leverage Burden:** Market-implied assets (₹{va:,.0f}) tower over the "
+            f"effective default boundary (₹{dp:,.0f}). Debt makes up just **{leverage:.1f}%** of the firm's total economic value.\n"
+            f"- **Solvency Buffer:** The firm's enterprise value would have to plummet by more than "
+            f"**{100 - leverage:.1f}%** before its asset base breaches debt commitments.\n"
+            f"- **Why PD displays 0.00%:** In a standard normal distribution $\\Phi(-DD)$, any Z-score past $5.0\\sigma$ "
+            f"drops below $10^{{-7}}$. At {dd:.2f}σ, Gaussian probability evaluates to less than $10^{{-30}}$, which floating-point "
+            f"precision rounds directly to zero. In actual commercial lending (e.g. Moody's KMV EDF), a minimum regulatory floor of "
+            f"~0.03% (3 bps) is applied because statistical models do not account for extreme external shocks (fraud, sudden regulatory bans)."
+        )
+
+    # Case 2: Standard Investment Grade / Low Risk
+    elif dd >= 3.0:
+        commentary = (
+            f"**What does {name}'s score of {dd:.2f}σ signify?**\n\n"
+            f"- **Healthy Solvency Coverage:** Implied assets of ₹{va:,.0f} offer a comfortable cushion against "
+            f"the default point of ₹{dp:,.0f} (leverage stands at **{leverage:.1f}%**).\n"
+            f"- **Manageable Volatility:** Solved asset volatility is **{vol:.1f}%**, meaning the asset base is reasonably "
+            f"stable and unlikely to erode toward default within the 1-year horizon."
+        )
+
+    # Case 3: Watchlist / Grey Zone
+    elif dd >= 1.5:
+        commentary = (
+            f"**⚠️ Watchlist Alert for {name} ({dd:.2f}σ):**\n\n"
+            f"- **Narrowing Cushion:** Leverage has climbed to **{leverage:.1f}%** (Default Point: ₹{dp:,.0f} vs. Assets: ₹{va:,.0f}).\n"
+            f"- **Vulnerability to Volatility:** Given an asset volatility of **{vol:.1f}%**, an equity price drawdown or "
+            f"earnings contraction could quickly push the company into distress territory."
+        )
+
+    # Case 4: Distress / Near-Default
+    else:
+        commentary = (
+            f"**🚨 High Distress Signal for {name} ({dd:.2f}σ):**\n\n"
+            f"- **Extreme Debt Overhang:** Debt obligations represent **{leverage:.1f}%** of the firm's economic value.\n"
+            f"- **High Probability of Default:** Market pricing reflects a 1-year default probability of **{pd_val:.2f}%**. "
+            f"The asset cushion is critically thin relative to near-term debt maturities."
+        )
+
+    return commentary
+
+def get_live_equity_volatility(ticker: str, fallback_vol: float = 0.35) -> float:
+    """
+    Fetches 1 year of daily close data from Yahoo Finance
+    and computes annualized historical volatility.
+    """
+    if not ticker:
+        return fallback_vol
+
+    # Try National Stock Exchange (.NS) then Bombay Stock Exchange (.BO)
+    for suffix in [".NS", ".BO"]:
+        symbol = f"{ticker.strip().upper()}{suffix}"
+        try:
+            df = yf.download(symbol, period="1y", interval="1d", progress=False)
+            if df is not None and len(df) > 60:
+                # Handle MultiIndex columns returned by newer yfinance versions
+                if "Close" in df.columns:
+                    closes = df["Close"]
+                    if hasattr(closes, "iloc") and closes.ndim > 1:
+                        closes = closes.iloc[:, 0]
+                    returns = np.log(closes / closes.shift(1)).dropna()
+                    annualized_vol = float(returns.std() * np.sqrt(252))
+                    if 0.05 <= annualized_vol <= 2.5:
+                        return annualized_vol
+        except Exception:
+            continue
+
+    return fallback_vol
