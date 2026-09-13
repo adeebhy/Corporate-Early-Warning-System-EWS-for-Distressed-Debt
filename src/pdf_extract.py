@@ -1,103 +1,154 @@
 """
-pdf_extract.py
-----------------
-Extracts financial statement line items from an uploaded annual report /
-financial statement PDF using pdfplumber (text + table extraction) plus
-regex line-item matching.
-
-HONESTY NOTE, please read: real annual report PDFs vary enormously in
-layout (multi-column, scanned images, inconsistent line-item naming across
-companies and years, numbers in different units on different pages). This
-extractor is a genuine best-effort tool, not a guaranteed-correct one -- it
-is deliberately built to ALWAYS show you what it extracted for confirmation
-before computing any score, rather than silently trusting a number that
-might have been misread from a messy table. Treat every extracted value as
-a first draft to verify, not a verified fact.
+src/pdf_extract.py
+------------------
+Extracts fundamental financial metrics from uploaded corporate annual report /
+financial statement PDFs using regex pattern matching over text streams.
 """
+
 import re
-import pdfplumber
-
-LINE_ITEM_PATTERNS = {
-    "total_assets": [r"total\s+assets"],
-    "total_liabilities": [r"total\s+liabilit(y|ies)", r"total\s+equity\s+and\s+liabilit"],
-    "total_equity": [r"total\s+equity\b", r"shareholders?.?\s+funds?", r"net\s+worth"],
-    "current_assets": [r"total\s+current\s+assets"],
-    "current_liabilities": [r"total\s+current\s+liabilit"],
-    "sales": [r"revenue\s+from\s+operations", r"total\s+revenue", r"net\s+sales", r"^\s*sales\b"],
-    "ebitda": [r"\bebitda\b"],
-    "ebit": [r"\bebit\b(?!da)", r"operating\s+profit", r"profit\s+before\s+interest\s+and\s+tax"],
-    "interest_expense": [r"finance\s+cost", r"interest\s+expense"],
-    "net_income": [r"profit\s+for\s+the\s+(year|period)", r"net\s+profit", r"profit\s+after\s+tax"],
-    "cfo": [r"cash\s+(flow\s+)?(generated\s+from|from)\s+operating\s+activit"],
-    "retained_earnings": [r"retained\s+earnings", r"surplus\s+in\s+(the\s+)?statement\s+of\s+profit"],
-    "inventory": [r"\binventor(y|ies)\b"],
-    "receivables": [r"trade\s+receivables"],
-    "payables": [r"trade\s+payables"],
-}
-
-NUMBER_RE = re.compile(r"[-(]?[\d,]+\.?\d*[)]?")
+from typing import Any, Dict
+from pypdf import PdfReader
 
 
-def _extract_numbers_from_line(line: str) -> list:
-    nums = []
-    for match in NUMBER_RE.finditer(line):
-        raw = match.group().replace(",", "")
-        neg = raw.startswith("(") and raw.endswith(")")
-        raw = raw.strip("()")
-        try:
-            val = float(raw)
-            if val == 0 and len(raw) <= 1:
-                continue
-            nums.append(-val if neg else val)
-        except ValueError:
-            continue
-    return nums
+def _clean_number(text: str) -> float | None:
+    if not text:
+        return None
+    cleaned = re.sub(r"[^\d.-]", "", text.strip())
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
 
 
-def extract_from_pdf(file_path_or_buffer) -> dict:
-    """Scans every page's text line by line matching known line-item labels,
-    pulling the FIRST number on that line (statements conventionally put the
-    current-period figure first). Falls back to table extraction for any
-    line items not found via plain text."""
-    found = {}
-    found_context = {}
+def extract_from_pdf(uploaded_file) -> Dict[str, Any]:
+    """
+    Extracts core financial statement metrics from an uploaded PDF stream.
+    """
+    reader = PdfReader(uploaded_file)
+    pages_text = []
+    for idx, page in enumerate(reader.pages):
+        text = page.extract_text() or ""
+        pages_text.append((idx + 1, text))
 
-    with pdfplumber.open(file_path_or_buffer) as pdf:
-        for page_num, page in enumerate(pdf.pages):
-            text = page.extract_text() or ""
+    # Field aliases mapped to common statement line labels
+    field_patterns = {
+        "total_assets": [
+            r"total\s+assets",
+            r"total\s+non-current\s+assets\s*\+\s*total\s+current\s+assets",
+        ],
+        "total_liabilities": [
+            r"total\s+liabilities",
+            r"total\s+debt",
+            r"total\s+borrowings",
+        ],
+        "current_assets": [
+            r"total\s+current\s+assets",
+            r"current\s+assets",
+        ],
+        "current_liabilities": [
+            r"total\s+current\s+liabilities",
+            r"current\s+liabilities",
+        ],
+        "retained_earnings": [
+            r"retained\s+earnings",
+            r"other\s+equity",
+            r"reserves\s+and\s+surplus",
+        ],
+        "total_equity": [
+            r"total\s+equity",
+            r"shareholders['\s]+funds",
+            r"equity\s+share\s+capital",
+        ],
+        "sales": [
+            r"revenue\s+from\s+operations",
+            r"total\s+revenue",
+            r"sales",
+        ],
+        "expenses": [
+            r"total\s+expenses",
+            r"cost\s+of\s+materials\s+consumed",
+        ],
+        "ebit": [
+            r"operating\s+profit",
+            r"profit\s+before\s+tax\s+and\s+finance\s+costs",
+            r"ebit",
+        ],
+        "ebitda": [
+            r"ebitda",
+            r"operating\s+profit\s+before\s+working\s+capital",
+        ],
+        "interest_expense": [
+            r"finance\s+costs",
+            r"interest\s+expense",
+            r"interest",
+        ],
+        "net_income": [
+            r"profit\s+for\s+the\s+period",
+            r"profit\s+for\s+the\s+year",
+            r"net\s+profit",
+            r"net\s+income",
+        ],
+        "receivables": [
+            r"trade\s+receivables",
+            r"sundry\s+debtors",
+        ],
+        "payables": [
+            r"trade\s+payables",
+            r"sundry\s+creditors",
+        ],
+        "inventory": [
+            r"inventories",
+            r"inventory",
+            r"stock-in-trade",
+        ],
+        "cfo": [
+            r"net\s+cash\s+(?:flow\s+)?from\s+operating\s+activities",
+            r"cash\s+generated\s+from\s+operations",
+        ],
+    }
+
+    extracted: Dict[str, float] = {}
+    context: Dict[str, Dict[str, Any]] = {}
+    target_fields = list(field_patterns.keys())
+
+    # Scan pages sequentially for pattern matches
+    for field, patterns in field_patterns.items():
+        matched = False
+        for page_num, text in pages_text:
+            if matched:
+                break
             for line in text.split("\n"):
-                line_lower = line.lower()
-                for canonical, patterns in LINE_ITEM_PATTERNS.items():
-                    if canonical in found:
-                        continue
-                    if any(re.search(p, line_lower) for p in patterns):
-                        nums = _extract_numbers_from_line(line)
-                        if nums:
-                            found[canonical] = nums[0]
-                            found_context[canonical] = dict(page=page_num + 1, line=line.strip())
+                line_clean = line.strip()
+                if not line_clean:
+                    continue
 
-            missing = [k for k in LINE_ITEM_PATTERNS if k not in found]
-            if not missing:
-                continue
-            tables = page.extract_tables() or []
-            for table in tables:
-                for row in table:
-                    if not row or not row[0]:
-                        continue
-                    label = str(row[0]).lower()
-                    for canonical in list(missing):
-                        if canonical in found:
-                            continue
-                        if any(re.search(p, label) for p in LINE_ITEM_PATTERNS[canonical]):
-                            for cell in row[1:]:
-                                if cell is None:
-                                    continue
-                                nums = _extract_numbers_from_line(str(cell))
-                                if nums:
-                                    found[canonical] = nums[0]
-                                    found_context[canonical] = dict(page=page_num + 1, line=f"(table) {row}")
-                                    break
+                for pat in patterns:
+                    regex = rf"(?i)\b{pat}\b.*?([\(\[\d][\d,\.\(\)\]\-]+)"
+                    m = re.search(regex, line_clean)
+                    if m:
+                        val_str = m.group(1)
+                        # Handle accounting parentheses as negative values: (123.45)
+                        if val_str.startswith("(") and val_str.endswith(")"):
+                            val_str = "-" + val_str[1:-1]
 
-    return dict(extracted=found, context=found_context,
-                n_fields_found=len(found), n_fields_total=len(LINE_ITEM_PATTERNS),
-                missing_fields=[k for k in LINE_ITEM_PATTERNS if k not in found])
+                        val = _clean_number(val_str)
+                        if val is not None:
+                            extracted[field] = val
+                            context[field] = {
+                                "page": page_num,
+                                "line": line_clean,
+                            }
+                            matched = True
+                            break
+                if matched:
+                    break
+
+    missing_fields = [f for f in target_fields if f not in extracted]
+
+    return {
+        "extracted": extracted,
+        "context": context,
+        "missing_fields": missing_fields,
+        "n_fields_found": len(extracted),
+        "n_fields_total": len(target_fields),
+    }
